@@ -5,18 +5,27 @@ The runner yields events; everything visual lives here.
 """
 
 import json
+import shutil
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import Application
 from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout.containers import HSplit, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style as PromptStyle
-from rich.console import Console, ConsoleOptions, RenderResult
+from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.segment import Segment
+from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text as RichText
 from rich.theme import Theme
@@ -47,7 +56,7 @@ THEME = Theme({
     "markdown.item.number": PALETTE["accent"],
 })
 
-COMMANDS = {"/new": "start a new session", "/sessions": "switch session", "/help": "show commands", "/exit": "quit"}
+COMMANDS = {"/new": "start a new session", "/sessions": "switch session", "/details": "show tool calls of the last reply", "/clear": "restart this session's context", "/help": "show commands", "/exit": "quit"}
 
 
 def make_console() -> Console:
@@ -60,80 +69,107 @@ class _Tail:
     """The last lines of a Markdown document, so the live view never outgrows the screen
     (Rich cannot redraw a live region taller than the terminal)."""
 
-    def __init__(self, source: str):
+    def __init__(self, source: str, max_lines: int | None = None):
         self.source = source
+        self.max_lines = max_lines
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         lines = console.render_lines(Markdown(self.source, code_theme=CODE_THEME), options, pad=False)
-        for line in lines[-max(console.height - 3, 5):]:
+        budget = self.max_lines or max(console.height - 3, 5)
+        for line in lines[-budget:]:
             yield from line
             yield Segment.line()
 
 
-class ReplyView:
-    """Shows a spinner while waiting, the reply as it streams, and one line per tool call.
+def _checklist(display: str, indent: str = "    ") -> RichText:
+    text = RichText()
+    for i, line in enumerate(display.splitlines()):
+        style = {"[x]": "ok", "[~]": "accent"}.get(line[:3], "muted")
+        text.append(("\n" if i else "") + indent + line, style=style)
+    return text
 
-    While streaming, a transient live view shows the tail of the reply; when a text block
-    ends it is replaced by one final full Markdown render.
+
+class ReplyView:
+    """One reply, drawn in three parts:
+    - a live region (spinner, or the streaming reply) that updates in place;
+    - the plan, a checklist printed once per change, just before the reply text;
+    - tool calls, kept in `log` and folded into one summary line (see /details).
     """
 
     def __init__(self, console: Console):
         self.console = console
+        self.log: list[ToolUse | ToolEnd] = []
         self._buffer = ""
         self._live: Live | None = None
-        self._status = None
+        self._plan: str | None = None
+        self._plan_dirty = False
 
     def waiting(self, label: str = "thinking") -> None:
-        if self._status is None and self._live is None:
-            self._status = self.console.status(f"[muted]{label}…[/]", spinner="dots", spinner_style="accent")
-            self._status.start()
+        spinner = Spinner("dots", text=RichText(f"{label}…", style="muted"), style="accent")
+        self._show(Group(spinner, _checklist(self._plan)) if self._plan else spinner)
 
     def text(self, chunk: str) -> None:
-        self._stop_status()
-        if self._live is None:
-            self._live = Live(_Tail(""), console=self.console, transient=True, refresh_per_second=10)
-            self._live.start()
         self._buffer += chunk
-        self._live.update(_Tail(self._buffer))
+        self._show(_Tail(self._buffer))
 
     def tool_use(self, event: ToolUse) -> None:
-        self.flush()
-        self.console.print(RichText.assemble(
-            ("  → ", "tool"), (event.name, "bold tool"), ("  " + tool_detail(event), "muted")))
-        self.waiting("working")
+        self.flush_text()
+        self.log.append(event)
+        self.waiting(event.name)
 
     def tool_end(self, event: ToolEnd) -> None:
-        self._stop_status()
-        status = ("ok", "ok") if event.ok else ("FAILED", "error")
-        self.console.print(RichText.assemble(
-            ("  ← ", "tool"), (event.name, "bold tool"), ("  ", ""), status,
-            (f"  {event.seconds:.1f}s · {event.chars:,} chars", "muted")))
+        self.log.append(event)
+        if event.name == "plan" and event.ok and event.display:
+            self._plan, self._plan_dirty = event.display, True
         self.waiting("thinking")
 
-    def flush(self) -> None:
-        """Finish the current text block: replace the live tail with the final render."""
-        self._stop_status()
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
+    def flush_text(self) -> None:
+        """End the current text block: print a changed plan, then the reply as Markdown."""
+        self._stop()
+        if self._buffer:
+            if self._plan_dirty:
+                self._print_plan()
             self.console.print(Markdown(self._buffer, code_theme=CODE_THEME))
-        self._buffer = ""
+            self._buffer = ""
+
+    def finish(self) -> None:
+        self.flush_text()
+        if self._plan_dirty:
+            self._print_plan()
 
     def close(self) -> None:
-        """Abandon whatever is on screen (interrupted or failed turn)."""
-        self._stop_status()
+        """Abandon what is on screen (interrupted or failed turn)."""
+        self._stop()
+        self._buffer = ""
+
+    def summary(self) -> str | None:
+        counts = Counter(e.name for e in self.log if isinstance(e, ToolUse))
+        if not counts:
+            return None
+        names = ", ".join(f"{name} ×{n}" if n > 1 else name for name, n in counts.items())
+        total = sum(counts.values())
+        return f"▸ {total} tool call{'s' if total != 1 else ''}: {names} · /details to expand"
+
+    def _print_plan(self) -> None:
+        self.console.print(RichText("  plan", style="bold accent"))
+        self.console.print(_checklist(self._plan))
+        self._plan_dirty = False
+
+    def _show(self, renderable) -> None:
+        if self._live is None:
+            self._live = Live(renderable, console=self.console, transient=True, refresh_per_second=10)
+            self._live.start()
+        else:
+            self._live.update(renderable)
+
+    def _stop(self) -> None:
         if self._live is not None:
             self._live.stop()
             self._live = None
-        self._buffer = ""
-
-    def _stop_status(self) -> None:
-        if self._status is not None:
-            self._status.stop()
-            self._status = None
 
 
-def stream_reply(console: Console, runner: LLMRunner, message: str) -> None:
+def stream_reply(console: Console, runner: LLMRunner, message: str) -> list:
+    """Draw one turn. Returns the tool log of this turn, for /details."""
     console.print()
     view = ReplyView(console)
     view.waiting()
@@ -145,7 +181,7 @@ def stream_reply(console: Console, runner: LLMRunner, message: str) -> None:
                 view.tool_use(event)
             elif isinstance(event, ToolEnd):
                 view.tool_end(event)
-        view.flush()
+        view.finish()
     except KeyboardInterrupt:
         view.close()
         console.print("[error]interrupted · turn not saved[/]")
@@ -153,7 +189,27 @@ def stream_reply(console: Console, runner: LLMRunner, message: str) -> None:
         view.close()
         console.print(RichText(f"error: {e}", style="error"))
     else:
+        if summary := view.summary():
+            console.print(RichText("  " + summary, style="muted"))
         console.print(RichText("  " + stats_line(runner.last_stats), style="muted"))
+    return view.log
+
+
+def render_details(console: Console, log: list) -> None:
+    """The full tool log of the last reply, as it happened."""
+    if not log:
+        console.print(RichText("  no tool calls in the last reply", style="muted"))
+        return
+    for event in log:
+        if isinstance(event, ToolUse):
+            console.print(RichText.assemble(("  → ", "tool"), (event.name, "bold tool"), ("  " + tool_detail(event), "muted")))
+            continue
+        status = ("ok", "ok") if event.ok else ("FAILED", "error")
+        console.print(RichText.assemble(
+            ("  ← ", "tool"), (event.name, "bold tool"), ("  ", ""), status,
+            (f"  {event.seconds:.1f}s · {event.chars:,} chars", "muted")))
+        if event.display:
+            console.print(_checklist(event.display))
 
 
 def tool_detail(event: ToolUse) -> str:
@@ -163,7 +219,10 @@ def tool_detail(event: ToolUse) -> str:
     except ValueError:
         return event.detail  # server-side search: detail is already the query
     if isinstance(args, dict) and args:
-        return str(next(iter(args.values())))
+        value = next(iter(args.values()))
+        if isinstance(value, list):
+            return f"{len(value)} items"
+        return str(value)
     return event.detail
 
 
@@ -178,8 +237,6 @@ def stats_line(stats: dict | None) -> str:
     if u["output_tokens"] and t["total"] > 0:
         # output tokens (incl. reasoning) over the whole turn, so tool and thinking time count against speed
         parts.append(f"{u['output_tokens'] / t['total']:.0f} tok/s")
-    if stats["searches"] or stats["tools"]:
-        parts.append(f"{len(stats['searches'])} searches · {len(stats['tools'])} tool calls")
     return " · ".join(parts)
 
 
@@ -212,33 +269,149 @@ def make_prompt(history_path: Path, toolbar) -> PromptSession:
 
 # ---- sessions and banners -------------------------------------------------------------------
 
+PICKER_SHARE = 0.4  # the session picker never takes more than this share of the terminal height
+
+
+def picker_max_height(terminal_lines: int) -> int:
+    return max(4, int(terminal_lines * PICKER_SHARE))
+
+
+def picker_fragments(sessions: list[Session], index: int, width: int = 80) -> list:
+    """One line per session, fitted to the terminal width: the title takes the room that is left."""
+    title_width = max(16, width - 30)  # marker, turn count, date and margins
+    rows = []
+    for i, s in enumerate(sessions):
+        title = " ".join((s.title or "(untitled)").split())
+        if len(title) > title_width:
+            title = title[: title_width - 1] + "…"
+        when = datetime.fromtimestamp(s.path.stat().st_mtime).strftime("%b %d %H:%M")
+        turns = f"{s.turns} turn{'s' if s.turns != 1 else ''}"
+        selected = i == index
+        marker = "▸ " if selected else "  "
+        rows.append(("class:current" if selected else "class:row",
+                     f"{marker}{title:<{title_width}} {turns:>8}  {when}" + ("\n" if i < len(sessions) - 1 else "")))
+    return rows
+
+
 def choose_session(console: Console, root: Path, name: str | None) -> Session:
-    existing = Session.list(root) if root.exists() else []
-    if not existing:
+    """Inline picker. Arrows / PageUp / PageDown move, Enter opens, n or Esc starts a new session.
+    The list scrolls inside a window capped at PICKER_SHARE of the terminal height."""
+    sessions = Session.list(root) if root.exists() else []
+    if not sessions:
         return Session.new(root, name)
 
-    table = Table(box=None, header_style="muted", padding=(0, 2))
-    for column in ("#", "session", "turns", "last used"):
-        table.add_column(column)
-    for i, s in enumerate(existing, 1):
-        when = datetime.fromtimestamp(s.path.stat().st_mtime).strftime("%b %d %H:%M")
-        table.add_row(RichText(str(i), style="accent"), s.title or "(untitled)", str(s.turns), RichText(when, style="muted"))
-    console.print(table)
-    while True:
-        choice = console.input("[muted]resume which? number, or Enter for a new session ❯ [/]").strip()
-        if not choice:
-            return Session.new(root, name)
-        if choice.isdigit() and 1 <= int(choice) <= len(existing):
-            return existing[int(choice) - 1]
+    index = 0
+    width = shutil.get_terminal_size().columns
+    body = Window(
+        content=FormattedTextControl(lambda: picker_fragments(sessions, index, width),
+                                     get_cursor_position=lambda: Point(0, index)),
+        height=Dimension(min=1, preferred=len(sessions), max=picker_max_height(shutil.get_terminal_size().lines)),
+    )
+    hint = Window(height=1, content=FormattedTextControl(
+        [("class:hint", f" {len(sessions)} sessions · ↑/↓ move · PgUp/PgDn page · Enter open · n new")]))
+
+    keys = KeyBindings()
+
+    @keys.add("up")
+    def _up(event):
+        nonlocal index
+        index = max(0, index - 1)
+
+    @keys.add("down")
+    def _down(event):
+        nonlocal index
+        index = min(len(sessions) - 1, index + 1)
+
+    @keys.add("pageup")
+    def _pgup(event):
+        nonlocal index
+        index = max(0, index - 5)
+
+    @keys.add("pagedown")
+    def _pgdn(event):
+        nonlocal index
+        index = min(len(sessions) - 1, index + 5)
+
+    @keys.add("enter")
+    def _open(event):
+        event.app.exit(result=sessions[index])
+
+    @keys.add("n")
+    @keys.add("escape")
+    @keys.add("c-c")
+    def _new(event):
+        event.app.exit(result=None)
+
+    app = Application(
+        layout=Layout(HSplit([body, hint])),
+        key_bindings=keys,
+        full_screen=False,
+        erase_when_done=True,  # the list disappears once you choose
+        style=PromptStyle.from_dict({
+            "current": f"bold {PALETTE['accent']}", "row": "", "hint": PALETTE["muted"],
+        }),
+    )
+    chosen = app.run()
+    return chosen if chosen is not None else Session.new(root, name)
+
+
+def replay(console: Console, session: Session) -> None:
+    """Draw the saved conversation the way it looked live: each question, the plan checklist,
+    the reply as Markdown, and the folded tool-call summary."""
+    items = session.items
+    names = {i["call_id"]: i["name"] for i in items if i.get("type") == "function_call"}
+    tool_counts: Counter = Counter()
+    plan: str | None = None  # a checklist waiting to be printed, as in the live view
+
+    def flush_tools() -> None:
+        if tool_counts:
+            total = sum(tool_counts.values())
+            listing = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in tool_counts.items())
+            console.print(RichText(f"  ▸ {total} tool call{'s' if total != 1 else ''}: {listing}", style="muted"))
+            tool_counts.clear()
+
+    def flush_plan() -> None:
+        nonlocal plan
+        if plan:
+            console.print(RichText("  plan", style="bold accent"))
+            console.print(_checklist(plan))
+            plan = None
+
+    for item in items:
+        if item.get("role") == "user":
+            flush_plan()
+            flush_tools()
+            console.print()
+            console.print(RichText.assemble(("you ❯ ", "bold accent"), (_text(item), "")))
+        elif item.get("type") == "function_call":
+            tool_counts[item["name"]] += 1
+        elif item.get("type") == "function_call_output" and names.get(item["call_id"]) == "plan":
+            lines = [l for l in item["output"].splitlines() if l[:3] in ("[ ]", "[~]", "[x]")]
+            plan = "\n".join(lines) or plan
+        elif item.get("role") == "assistant":
+            flush_plan()
+            console.print()
+            console.print(Markdown(_text(item), code_theme=CODE_THEME))
+    flush_plan()
+    flush_tools()
+    turns = session.turns
+    console.print()
+    console.print(RichText(f"── resumed · {turns} turn{'s' if turns != 1 else ''} ──", style="muted"))
+
+
+def clear_screen(console: Console) -> None:
+    """Wipe the visible screen and the scrollback, like `clear` does."""
+    if console.is_terminal:
+        console.file.write("\x1b[2J\x1b[3J\x1b[H")
+        console.file.flush()
 
 
 def banner(console: Console, runner: LLMRunner) -> None:
-    session = runner.session
     console.print()
     console.print(RichText.assemble(("ai-harness", "bold accent"), (f"  {runner.config.model}", "muted")))
     console.print(RichText("Enter sends · Alt+Enter newline · /help for commands", style="muted"))
-    for role, text in _recent(session):
-        console.print(RichText(f"  {role}: {text[:200]}", style="muted"))
+    if runner.session.items:
+        replay(console, runner.session)
     console.print()
 
 
@@ -247,11 +420,8 @@ def help_text(console: Console) -> None:
         console.print(RichText.assemble((f"  {command:<10}", "accent"), (meaning, "muted")))
 
 
-def _recent(session: Session) -> list[tuple[str, str]]:
-    """The last user message and assistant reply, for context after resuming."""
-    def text(item: dict) -> str:
-        content = item["content"]
-        return content if isinstance(content, str) else "".join(p.get("text", "") for p in content)
-
-    messages = [(i["role"], text(i)) for i in session.items if i.get("role") in ("user", "assistant")]
-    return [(role, " ".join(body.split())) for role, body in messages[-2:]]
+def _text(item: dict) -> str:
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    return "".join(part.get("text", "") for part in content or [])
