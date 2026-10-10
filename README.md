@@ -27,6 +27,10 @@ Tool activity is shown as it happens, and every reply ends with a stats line:
   [11987 in / 158 out (86 reasoning) · $0.00079 · first token 6.06s · total 6.24s · 25 tok/s · 2 model calls, 0 searches, 1 tool calls]
 ```
 
+Commands: `/new`, `/sessions`, `/clear` (reset the model's context and the screen; the transcript stays
+in the file), `/details` (full tool log of the last reply), `/help`, `/exit`. Resuming a session replays
+the whole conversation.
+
 Options:
 
 ```bash
@@ -39,6 +43,7 @@ uv run --env-file .env harness --model z-ai/glm-5.3-flash
 | Tool | Where it runs | Notes |
 |---|---|---|
 | `web_search` | OpenRouter (server tool) | Exa engine, about $0.007 per search, at most 3 per model call. The model writes the queries; guidance is in the system prompt. |
+| `plan` | here | A checklist the model keeps up to date on multi-step tasks; shown in place with green checks. |
 | `fetch_url` | here | Reads a page as text, 12k characters at a time (the model pages with `start`). Refuses non-public addresses, including via redirects. |
 
 Tool output is capped at 20k characters so one result can't flood the context.
