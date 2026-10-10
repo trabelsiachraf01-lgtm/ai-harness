@@ -170,13 +170,13 @@ def test_clear_screen_wipes_screen_and_scrollback_only_on_a_terminal():
 def test_file_changes_are_never_folded_away():
     c = console()
     view = ReplyView(c)
-    view.tool_use(ToolUse("edit_file", '{"path": "src/app.py", "old_string": "a", "new_string": "b"}'))
-    view.tool_end(ToolEnd("edit_file", 0.0, 30, True, "src/app.py\n-a\n+b"))
-    view.tool_use(ToolUse("write_file", '{"path": "notes.md", "content": "hi"}'))
-    view.tool_end(ToolEnd("write_file", 0.0, 30, False))  # failed writes are not announced as done
+    view.tool_use(ToolUse("edit", '{"command": "sed -i \'s/a/b/\' src/app.py"}'))
+    view.tool_end(ToolEnd("edit", 0.0, 30, True, "sed -i"))
+    view.tool_use(ToolUse("write", '{"command": "tee notes.md"}'))
+    view.tool_end(ToolEnd("write", 0.0, 30, False))  # failed writes are not announced as done
     view.finish()
     out = c.file.getvalue()
-    assert "✎ edited src/app.py" in out and "notes.md" not in out
+    assert "✎ edited sed -i" in out and "notes.md" not in out
 
 
 def test_replay_announces_successful_file_changes(tmp_path):
@@ -184,14 +184,14 @@ def test_replay_announces_successful_file_changes(tmp_path):
     from harness.ui import replay
     s = Session.new(tmp_path)
     s.append_turn([{"role": "user", "content": "fix it"},
-                   {"type": "function_call", "call_id": "c1", "name": "edit_file",
-                    "arguments": '{"path": "a.py", "old_string": "x", "new_string": "y"}'},
+                   {"type": "function_call", "call_id": "c1", "name": "edit",
+                    "arguments": '{"command": "sed -i \'s/x/y/\' a.py"}'},
                    {"type": "function_call_output", "call_id": "c1", "output": "Edited a.py: 1 replacement"},
-                   {"type": "function_call", "call_id": "c2", "name": "write_file",
-                    "arguments": '{"path": "b.py", "content": "z"}'},
+                   {"type": "function_call", "call_id": "c2", "name": "write",
+                    "arguments": '{"command": "tee b.py"}'},
                    {"type": "function_call_output", "call_id": "c2", "output": "Error: b.py already exists."},
                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}], {})
     c = console(width=80, height=40)
     replay(c, s)
     out = c.file.getvalue()
-    assert "✎ edited a.py" in out and "b.py" not in out.replace("write_file", "")
+    assert "✎ edited sed -i" in out and "b.py" not in out

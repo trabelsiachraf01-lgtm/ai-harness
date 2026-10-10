@@ -7,7 +7,7 @@ from datetime import date
 import httpx
 
 from harness.config import LLMConfig
-from harness.prompts import SYSTEM_PROMPT
+from harness.prompts import SYSTEM_PROMPT, tools_prompt
 from harness.sessions import Session
 from harness.tools import ToolRegistry, default_registry
 
@@ -60,7 +60,7 @@ class LLMRunner:
         session: Session,
         system_prompt: str = SYSTEM_PROMPT,
         tools: ToolRegistry | None = None,
-        max_steps: int = 8,
+        max_steps: int = 20,
         http: httpx.Client | None = None,
     ):
         self.config = config
@@ -76,42 +76,67 @@ class LLMRunner:
         )
 
     def chat(self, user_message: str) -> Iterator[Text | ToolUse | ToolEnd]:
+        """One user message -> model calls and tool calls until the model answers.
+
+        Normally the turn is saved when it completes, and a failed or interrupted turn leaves the
+        session untouched. The exception is a turn in which tools already ran: their effects are
+        real, so the steps that completed are saved (see `stopped` in the stats) and the model
+        remembers what it did.
+        """
         self.last_stats = None
         turn = [{"role": "user", "content": user_message}]  # everything this turn adds to the session
+        safe = 1  # turn[:safe] ends right after a complete step: no call without its output
         stats = {"model": None, "steps": 0, "searches": [], "tools": [],
-                 "usage": {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "cost": 0.0}}
+                 "usage": {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
+                           "cost": 0.0}}
         start = time.perf_counter()
         first_token: float | None = None
 
-        for _ in range(self.max_steps):
-            response = None
-            for event in self._stream(self._instructions(), [*self.session.items, *turn]):
-                if isinstance(event, _Final):
-                    response = event.response
-                    continue
-                if isinstance(event, Text) and first_token is None:
-                    first_token = time.perf_counter() - start
-                yield event
-            output = response["output"]
-            _tally(stats, response)
-            turn += [kept for item in output if (kept := _persistable(item))]
+        def save_partial(reason: str) -> None:
+            if safe > 1:
+                stats["stopped"] = reason
+                stats["timing"] = {"ttft": first_token, "total": time.perf_counter() - start}
+                self.session.append_turn(turn[:safe], stats)
+                self.last_stats = stats
 
-            calls = [item for item in output if item["type"] == "function_call"]
-            if not calls:
-                if not _text_of(output):
-                    raise LLMError("model returned an empty reply")
-                break
-            for call in calls:
-                yield ToolUse(call["name"], call["arguments"])
-                t0 = time.perf_counter()
-                result = self.tools.run(call["name"], call["arguments"])
-                seconds = time.perf_counter() - t0
-                yield ToolEnd(call["name"], seconds, len(result.output), result.ok, result.display, result.permission)
-                stats["tools"].append({"name": call["name"], "seconds": round(seconds, 3), "ok": result.ok,
-                                       "permission": result.permission})
-                turn.append({"type": "function_call_output", "call_id": call["call_id"], "output": result.output})
-        else:
-            raise LLMError(f"tool loop did not finish within {self.max_steps} steps")
+        try:
+            for _ in range(self.max_steps):
+                response = None
+                for event in self._stream(self._instructions(), [*self.session.items, *turn]):
+                    if isinstance(event, _Final):
+                        response = event.response
+                        continue
+                    if isinstance(event, Text) and first_token is None:
+                        first_token = time.perf_counter() - start
+                    yield event
+                output = response["output"]
+                _tally(stats, response)
+                turn += [kept for item in output if (kept := _persistable(item))]
+
+                calls = [item for item in output if item["type"] == "function_call"]
+                if not calls:
+                    if not _text_of(output):
+                        raise LLMError("model returned an empty reply")
+                    break
+                for call in calls:
+                    yield ToolUse(call["name"], call["arguments"])
+                    t0 = time.perf_counter()
+                    result = self.tools.run(call["name"], call["arguments"])
+                    seconds = time.perf_counter() - t0
+                    yield ToolEnd(call["name"], seconds, len(result.output), result.ok, result.display,
+                                  result.permission)
+                    stats["tools"].append({"name": call["name"], "seconds": round(seconds, 3), "ok": result.ok,
+                                           "permission": result.permission,
+                                           "error": None if result.ok else result.output[:300]})
+                    turn.append({"type": "function_call_output", "call_id": call["call_id"], "output": result.output})
+                safe = len(turn)
+            else:
+                save_partial("max_steps")
+                yield Text(f"\n[stopped: reached the limit of {self.max_steps} steps]")
+                return
+        except BaseException as e:  # LLMError, Ctrl-C, or the consumer closing the generator
+            save_partial(type(e).__name__)
+            raise
 
         stats["timing"] = {"ttft": first_token, "total": time.perf_counter() - start}
         self.session.append_turn(turn, stats)
@@ -120,7 +145,9 @@ class LLMRunner:
     def _instructions(self) -> str:
         # Without the date the model writes stale queries ("... 2025 ..."). It changes once a day,
         # so it only breaks the provider's prompt cache at midnight.
-        return f"{self.system_prompt}\nToday's date: {date.today().isoformat()}."
+        tools = tools_prompt(self.tools)
+        prompt = f"{self.system_prompt}\n\n{tools}" if tools else self.system_prompt
+        return f"{prompt}\nToday's date: {date.today().isoformat()}."
 
     def _stream(self, instructions: str, items: list[dict]) -> Iterator[Text | ToolUse | _Final]:
         """One model call over OpenRouter's Responses API (stateless: full history every call)."""

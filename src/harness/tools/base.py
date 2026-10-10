@@ -16,6 +16,7 @@ class Tool:
     description: str
     Args: type[BaseModel]
     needs_approval = True  # every tool asks first unless it opts out (e.g. plan has no side effects)
+    usage: str = ""  # guidance for the tools prompt: longer than `description`, with examples and limits
 
     def spec(self) -> dict:
         schema = self.Args.model_json_schema()

@@ -19,12 +19,19 @@ class ToolRegistry:
     """Holds client tools (we run them) and server tools (the provider runs them, spec only)."""
 
     def __init__(self, tools: Iterable[Tool] = (), server_tools: Iterable[dict] = (), max_output_chars: int = 20_000,
-                 permissions: Permissions | None = None):
+                 permissions: Permissions | None = None, server_notes: Iterable[str] = (),
+                 environment: str = ""):
         """`permissions=None` runs every tool without asking (tests, trusted internal use)."""
         self.permissions = permissions
+        self.server_notes = list(server_notes)
+        self.environment = environment
         self._tools = {t.name: t for t in tools}
         self._server_tools = list(server_tools)
         self.max_output_chars = max_output_chars
+
+    @property
+    def tools(self) -> list[Tool]:
+        return list(self._tools.values())
 
     def specs(self) -> list[dict]:
         return [t.spec() for t in self._tools.values()] + self._server_tools

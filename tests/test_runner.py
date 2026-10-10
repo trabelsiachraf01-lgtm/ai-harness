@@ -141,6 +141,7 @@ def test_tool_errors_go_back_to_the_model_not_up_the_stack(tmp_path):
     events = list(r.chat("go"))
     assert events[1].ok is False
     assert r.sent[1]["input"][-1]["output"].startswith("Error: unknown tool")
+    assert r.last_stats["tools"][0]["error"].startswith("Error: unknown tool")  # kept for diagnosis
 
 
 def test_server_search_is_shown_and_recorded_but_not_replayed(tmp_path):
@@ -152,11 +153,61 @@ def test_server_search_is_shown_and_recorded_but_not_replayed(tmp_path):
     assert all(i.get("type") != "openrouter:web_search" for i in Session.load(r.session.path).items)
 
 
-def test_runaway_tool_loop_is_stopped_and_not_saved(tmp_path):
+def _balanced(items):
+    """Every function_call has its output: the history is valid to send back to the model."""
+    calls = {i["call_id"] for i in items if i.get("type") == "function_call"}
+    outputs = {i["call_id"] for i in items if i.get("type") == "function_call_output"}
+    return calls == outputs
+
+
+def test_runaway_tool_loop_stops_but_keeps_what_the_tools_did(tmp_path):
     r = runner(tmp_path, [sse(completed([call()]))] * 3, tools=ToolRegistry([Echo()]), max_steps=3)
-    with pytest.raises(LLMError, match="within 3 steps"):
-        list(r.chat("loop"))
-    assert r.session.items == [] and not r.session.path.exists()
+    events = list(r.chat("loop"))
+    assert isinstance(events[-1], Text) and "limit of 3 steps" in events[-1].text
+    assert r.last_stats["stopped"] == "max_steps" and r.last_stats["steps"] == 3
+    saved = Session.load(r.session.path).items
+    assert saved[0]["content"] == "loop" and _balanced(saved) and len(saved) == 7  # user + 3 x (call, output)
+
+
+# ---- a turn that already ran tools is saved even when it stops early -----------------------
+
+def test_an_llm_error_after_a_tool_ran_keeps_the_completed_steps(tmp_path):
+    r = runner(tmp_path, [sse(completed([call()])), httpx.Response(401, json={"error": "bad"})],
+               tools=ToolRegistry([Echo()]))
+    with pytest.raises(LLMError):
+        list(r.chat("do it"))
+    saved = Session.load(r.session.path).items
+    assert [i.get("type", i.get("role")) for i in saved] == ["user", "function_call", "function_call_output"]
+    assert r.last_stats["stopped"] == "LLMError"
+
+
+def test_interrupting_after_a_tool_ran_keeps_the_completed_steps(tmp_path):
+    r = runner(tmp_path, [sse(completed([call()])), reply("partial answer")], tools=ToolRegistry([Echo()]))
+    gen = r.chat("go")
+    for event in gen:
+        if isinstance(event, Text):
+            break  # the user hits Ctrl-C while the second answer streams
+    gen.close()
+    saved = Session.load(r.session.path).items
+    assert _balanced(saved) and [i.get("type", i.get("role")) for i in saved][-1] == "function_call_output"
+    assert r.last_stats["stopped"] == "GeneratorExit"
+
+
+def test_a_step_interrupted_between_call_and_output_is_not_saved(tmp_path):
+    class Boom(Tool):
+        name = "echo"
+        description = "x"
+
+        class Args(BaseModel):
+            text: str
+
+        def run(self, args):
+            raise KeyboardInterrupt  # Ctrl-C while the tool runs
+
+    r = runner(tmp_path, [sse(completed([call()]))], tools=ToolRegistry([Boom()]))
+    with pytest.raises(KeyboardInterrupt):
+        list(r.chat("go"))
+    assert r.session.items == [] and not r.session.path.exists()  # no half step, nothing completed
 
 
 # ---- failures -------------------------------------------------------------------------------

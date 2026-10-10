@@ -33,7 +33,6 @@ class CliTool(Tool):
     """Subclasses set `name`, `description`, `programs`, `usage` and `Args`, and call `execute`."""
 
     programs: frozenset[str]
-    usage: str = ""  # longer guidance, assembled into the tools prompt
     paths_are_arguments = False  # True: every non-flag argument is a path and must stay in the workspace
 
     def __init__(self, cwd: Path, timeout: float = 30.0):
@@ -51,19 +50,19 @@ class CliTool(Tool):
         return args.command
 
     # ---- execution --------------------------------------------------------------------------
-    def execute(self, command: str, stdin: str | None = None) -> str:
+    def execute(self, command: str, stdin: str | None = None, *, echo: bool = True) -> str:
         argv = self.parse(command)
         env = {k: os.environ[k] for k in ENV_KEYS if k in os.environ}
         try:
             done = subprocess.run(
-                argv, cwd=self.cwd, env=env, capture_output=True, text=True, errors="replace",
-                timeout=self.timeout, input=stdin, stdin=None if stdin is not None else subprocess.DEVNULL,
+                argv, cwd=self.cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
+                timeout=self.timeout, input=stdin, start_new_session=True, stdin=None if stdin is not None else subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             raise ToolError(f"timed out after {self.timeout:g}s") from None
         except FileNotFoundError:
             raise ToolError(f"{argv[0]} is not installed on this machine") from None
-        out = done.stdout
+        out = done.stdout if echo else ""
         if done.stderr:
             out += ("\n" if out else "") + done.stderr
         if done.returncode != 0:

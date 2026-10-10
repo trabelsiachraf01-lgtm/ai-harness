@@ -61,7 +61,7 @@ THEME = Theme({
     "markdown.item.number": PALETTE["accent"],
 })
 
-FILE_CHANGES = {"write_file": "wrote", "edit_file": "edited"}  # always shown, never folded away
+FILE_CHANGES = {"write": "wrote", "edit": "edited"}  # always shown, never folded away
 
 COMMANDS = {"/new": "start a new session", "/sessions": "switch session", "/details": "show tool calls of the last reply", "/clear": "restart this session's context", "/permissions": "list or revoke allow rules", "/help": "show commands", "/exit": "quit"}
 
@@ -286,10 +286,12 @@ def stream_reply(console: Console, runner: LLMRunner, message: str,
         view.finish()
     except KeyboardInterrupt:
         view.close()
-        console.print("[error]interrupted · turn not saved[/]")
+        kept = runner.last_stats is not None
+        console.print(RichText("interrupted · " + ("completed steps were saved" if kept else "turn not saved"), style="error"))
     except LLMError as e:
         view.close()
-        console.print(RichText(f"error: {e}", style="error"))
+        saved = " · completed steps were saved" if runner.last_stats is not None else ""
+        console.print(RichText(f"error: {e}{saved}", style="error"))
     else:
         if summary := view.summary():
             console.print(RichText("  " + summary, style="muted"))

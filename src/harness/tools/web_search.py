@@ -8,6 +8,14 @@ Searches dwarf the token cost of a chat turn, so max_uses caps them per model re
 """
 
 
+USAGE = (
+    "web_search: use it for anything recent, version-specific, or that you can't answer reliably from memory. "
+    "Write specific, keyword-dense queries that cover what the user actually needs: the core question, a more "
+    "precise reformulation, and an official-source or recency angle. Prefer a few focused searches over one "
+    "vague one, and stop once you can answer. Cite sources as links."
+)
+
+
 def web_search_spec(engine: str = "exa", max_uses: int = 3, max_results: int = 5) -> dict:
     return {
         "type": "openrouter:web_search",
