@@ -51,7 +51,13 @@ class CliTool(Tool):
 
     # ---- execution --------------------------------------------------------------------------
     def execute(self, command: str, stdin: str | None = None, *, echo: bool = True) -> str:
-        argv = self.parse(command)
+        code, out = self._run(self.parse(command), stdin, echo=echo)
+        if code != 0:
+            out += f"\n[exit code {code}]"
+        return out if out.strip() else "[ok, no output]"
+
+    def _run(self, argv: list[str], stdin: str | None = None, *, echo: bool = True) -> tuple[int, str]:
+        """Run an already-validated argv. Returns (exit code, stdout + stderr)."""
         env = {k: os.environ[k] for k in ENV_KEYS if k in os.environ}
         try:
             done = subprocess.run(
@@ -65,9 +71,7 @@ class CliTool(Tool):
         out = done.stdout if echo else ""
         if done.stderr:
             out += ("\n" if out else "") + done.stderr
-        if done.returncode != 0:
-            out += f"\n[exit code {done.returncode}]"
-        return out if out.strip() else "[ok, no output]"
+        return done.returncode, out
 
     def parse(self, command: str) -> list[str]:
         try:

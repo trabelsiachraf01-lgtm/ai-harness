@@ -1,4 +1,4 @@
-import shlex
+import subprocess
 import sys
 from pathlib import PurePosixPath
 
@@ -28,13 +28,38 @@ class Edit(CliTool):
 
     def run(self, args: "Edit.Args") -> str:
         argv = self.parse(args.command)
-        if argv[0] == "patch":
-            if args.stdin is None:
-                raise ToolError("patch needs a unified diff in `stdin`")
-            self._check_diff_paths(args.stdin)
-        elif args.stdin is not None:
-            raise ToolError("`stdin` is only used with patch")
-        return self.execute(args.command, args.stdin)
+        if argv[0] != "patch":
+            if args.stdin is not None:
+                raise ToolError("`stdin` is only used with patch")
+            return self.execute(args.command)
+        if args.stdin is None:
+            raise ToolError("patch needs a unified diff in `stdin`")
+        self._check_diff_paths(args.stdin)
+        return self._apply_patch(argv[1:], args.stdin)
+
+    def _apply_patch(self, rest: list[str], diff: str) -> str:
+        """All or nothing. A dry run first, so a diff that only partly matches changes no file, and no
+        .orig/.rej files are left behind (patch writes them on offsets and rejected hunks)."""
+        flags = self._backup_flags()
+        code, out = self._run(["patch", "--dry-run", *flags, *rest], diff)
+        if code != 0:
+            raise ToolError(
+                "the diff does not apply cleanly, so nothing was changed. Read the file again and "
+                f"regenerate the diff from its current contents.\n{out.strip()}")
+        code, out = self._run(["patch", *flags, *rest], diff)
+        return out.strip() or "[ok, no output]" if code == 0 else f"{out.strip()}\n[exit code {code}]"
+
+    def _backup_flags(self) -> list[str]:
+        """No backup files. GNU patch and BSD patch (macOS) spell this differently."""
+        if self._flags is None:
+            try:
+                version = subprocess.run(["patch", "--version"], capture_output=True, text=True, timeout=5).stdout
+            except (OSError, subprocess.SubprocessError):
+                version = ""
+            self._flags = ["--no-backup-if-mismatch", "-r", "-"] if "GNU patch" in version else ["-V", "none"]
+        return self._flags
+
+    _flags: list[str] | None = None
 
     def parse(self, command: str) -> list[str]:
         argv = super().parse(command)

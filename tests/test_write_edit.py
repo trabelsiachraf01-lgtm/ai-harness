@@ -137,3 +137,41 @@ def test_tools_prompt_is_assembled_from_the_registry(work):
 
     only_read = ToolRegistry([Edit(work)])
     assert "- edit:" in tools_prompt(only_read) and "- write:" not in tools_prompt(only_read)
+
+
+# ---- patch is all-or-nothing and leaves no side files --------------------------------------
+
+def _leftovers(root):
+    return sorted(p.name for p in root.iterdir() if p.name.endswith((".orig", ".rej")))
+
+
+@pytest.mark.skipif(shutil.which("patch") is None, reason="patch not installed")
+def test_a_diff_with_shifted_line_numbers_applies_and_leaves_no_backup(work):
+    (work / "m.txt").write_text("zero\nzero2\none\ntwo\nthree\n")
+    diff = "--- m.txt\n+++ m.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"  # numbers are off by two
+    r = edit(work, "patch -p0", stdin=diff)
+    assert r.ok, r.output
+    assert (work / "m.txt").read_text() == "zero\nzero2\none\nTWO\nthree\n"
+    assert _leftovers(work) == []  # this is what showed up as CLAUDE.md.orig / .rej
+
+
+@pytest.mark.skipif(shutil.which("patch") is None, reason="patch not installed")
+def test_a_diff_that_only_partly_matches_changes_nothing(work):
+    original = "one\ntwo\nthree\nfour\n"
+    (work / "m.txt").write_text(original)
+    diff = ("--- m.txt\n+++ m.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n"      # this hunk would apply
+            "@@ -4,1 +4,1 @@\n-NOT THERE\n+x\n")                          # this one cannot
+    r = edit(work, "patch -p0", stdin=diff)
+    assert not r.ok and "nothing was changed" in r.output
+    assert (work / "m.txt").read_text() == original  # not half-patched
+    assert _leftovers(work) == []
+
+
+@pytest.mark.skipif(shutil.which("patch") is None, reason="patch not installed")
+def test_a_multi_file_diff_is_all_or_nothing(work):
+    (work / "a.txt").write_text("a1\n")
+    (work / "b.txt").write_text("b1\n")
+    diff = ("--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-a1\n+A1\n"
+            "--- b.txt\n+++ b.txt\n@@ -1 +1 @@\n-WRONG\n+B1\n")
+    assert not edit(work, "patch -p0", stdin=diff).ok
+    assert (work / "a.txt").read_text() == "a1\n"  # the good file was not touched either
