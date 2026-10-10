@@ -38,19 +38,35 @@ uv run --env-file .env harness --name "blog post"      # title for a new session
 uv run --env-file .env harness --model z-ai/glm-5.3-flash
 ```
 
-## Tools
+## Tools and permissions
 
-| Tool | Where it runs | Notes |
+Every tool that has side effects asks before each call. You choose: **once**, **this session**,
+**always** (saved to `~/.ai-harness/permissions.json`), or **deny** (with an optional reason that goes
+back to the model). Rules are keyed on `tool:program`, e.g. `read:grep`; `S` / `A` remember the whole
+tool. `/permissions` lists rules and `/permissions revoke <rule>` removes one. `--yes` disables
+approvals (sandboxes only).
+
+| Tool | Runs | What it does |
 |---|---|---|
-| `web_search` | OpenRouter (server tool) | Exa engine, about $0.007 per search, at most 3 per model call. The model writes the queries; guidance is in the system prompt. |
-| `plan` | here | A checklist the model keeps up to date on multi-step tasks; shown in place with green checks. |
-| `fetch_url` | here | Reads a page as text, 12k characters at a time (the model pages with `start`). Refuses non-public addresses, including via redirects. |
+| `read` | here, no shell | One read-only command: cat, head, tail, grep, rg, ls, find, wc, file, stat, tree, diff |
+| `write` | here, no shell | tee (content in `stdin`), touch, mkdir, cp, mv. Paths must stay in the workspace |
+| `edit` | here, no shell | sed or patch (diff in `stdin`). Paths must stay in the workspace |
+| `fetch_url` | here | Reads a page as text, paged. Refuses non-public addresses |
+| `plan` | here | A checklist the model keeps current; needs no approval |
+| `web_search` | OpenRouter | Server tool, about $0.007 per search. Cannot be gated by approvals |
 
-Tool output is capped at 20k characters so one result can't flood the context.
+Commands run with `shell=False`, so `;`, `|`, `$(...)` and `>` are plain arguments. The shell only gets
+`PATH`, `HOME` and a few other variables, never your API key. Credential files (`.env`, keys) are
+blocked, and the file tools are confined to the workspace (`HARNESS_WORKSPACE`, default: where you
+started). These checks prevent accidents; the approval prompt is the real control.
 
-To add a tool, create `src/harness/tools/<name>.py` with a `Tool` subclass (`name`, `description`,
-a pydantic `Args` model, `run()`), then register it in `tools/__init__.py`. The same `Args` model
-produces the schema the model sees and validates what it sends.
+The model's tool guidance is assembled from the registered tools (`tools_prompt` in `prompts.py`) and
+appended to the system prompt. To add a tool, create `src/harness/tools/<name>.py` with a `Tool`
+subclass (`name`, `description`, `usage`, a pydantic `Args`, `run()`) and register it in
+`tools/__init__.py`.
+
+A turn that already ran tools is saved even if it stops early (error, Ctrl-C, step limit), so the
+model remembers what it did.
 
 ## Sessions
 
