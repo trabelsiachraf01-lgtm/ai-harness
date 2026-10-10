@@ -10,6 +10,7 @@ from harness.tools.base import Tool, ToolError
 class ToolResult:
     output: str
     ok: bool = True
+    display: str | None = None
 
 
 class ToolRegistry:
@@ -35,6 +36,7 @@ class ToolRegistry:
             return ToolResult(f"Error: invalid arguments: {problems}", ok=False)
         try:
             output = tool.run(args)
+            display = tool.display(args)
         except ToolError as e:
             return ToolResult(f"Error: {e}", ok=False)
         except Exception as e:  # tool code is untrusted from the loop's point of view
@@ -42,4 +44,4 @@ class ToolRegistry:
         extra = len(output) - self.max_output_chars
         if extra > 0:  # a tool result must never be able to flood the context
             output = f"{output[: self.max_output_chars]}\n[output truncated: {extra} more characters]"
-        return ToolResult(output)
+        return ToolResult(output, display=display)

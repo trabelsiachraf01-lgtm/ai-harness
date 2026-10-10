@@ -23,3 +23,7 @@ class Tool:
 
     def run(self, args) -> str:
         raise NotImplementedError
+
+    def display(self, args) -> str | None:
+        """Optional text for the terminal only. The model never sees it."""
+        return None
