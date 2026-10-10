@@ -86,7 +86,7 @@ def test_streams_text_then_saves_the_turn(tmp_path):
     assert saved[1]["content"][0]["text"] == "Hello"
     assert saved[1]["content"][0]["annotations"] == []  # bulky citations are not replayed
     stats = r.last_stats
-    assert stats["usage"] == {"input_tokens": 7, "output_tokens": 2, "reasoning_tokens": 0, "cost": 0.001}
+    assert stats["usage"] == {"input_tokens": 7, "cached_tokens": 0, "output_tokens": 2, "reasoning_tokens": 0, "cost": 0.001}
     assert 0 <= stats["timing"]["ttft"] <= stats["timing"]["total"]
 
 
@@ -132,7 +132,7 @@ def test_tool_loop_runs_the_tool_feeds_it_back_and_saves_everything(tmp_path):
 
     saved = Session.load(r.session.path).items
     assert [i.get("type", i.get("role")) for i in saved] == ["user", "reasoning", "function_call", "function_call_output", "message"]
-    assert r.last_stats["usage"] == {"input_tokens": 30, "output_tokens": 9, "reasoning_tokens": 3, "cost": 0.005}
+    assert r.last_stats["usage"] == {"input_tokens": 30, "cached_tokens": 0, "output_tokens": 9, "reasoning_tokens": 3, "cost": 0.005}
     assert r.last_stats["steps"] == 2 and r.last_stats["tools"][0]["name"] == "echo"
 
 

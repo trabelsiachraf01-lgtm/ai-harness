@@ -77,7 +77,7 @@ class LLMRunner:
         self.last_stats = None
         turn = [{"role": "user", "content": user_message}]  # everything this turn adds to the session
         stats = {"model": None, "steps": 0, "searches": [], "tools": [],
-                 "usage": {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "cost": 0.0}}
+                 "usage": {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "cost": 0.0}}
         start = time.perf_counter()
         first_token: float | None = None
 
@@ -180,6 +180,7 @@ def _tally(stats: dict, response: dict) -> None:
     u, total = response.get("usage") or {}, stats["usage"]
     total["input_tokens"] += u.get("input_tokens", 0)
     total["output_tokens"] += u.get("output_tokens", 0)
+    total["cached_tokens"] += (u.get("input_tokens_details") or {}).get("cached_tokens", 0)
     total["reasoning_tokens"] += (u.get("output_tokens_details") or {}).get("reasoning_tokens", 0)
     total["cost"] += u.get("cost") or 0.0
     for item in response["output"]:
