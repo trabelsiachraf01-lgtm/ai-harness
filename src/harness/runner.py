@@ -36,6 +36,7 @@ class ToolEnd:  # a client tool finished
     chars: int
     ok: bool
     display: str | None = None
+    permission: str | None = None
 
 
 @dataclass
@@ -105,8 +106,9 @@ class LLMRunner:
                 t0 = time.perf_counter()
                 result = self.tools.run(call["name"], call["arguments"])
                 seconds = time.perf_counter() - t0
-                yield ToolEnd(call["name"], seconds, len(result.output), result.ok, result.display)
-                stats["tools"].append({"name": call["name"], "seconds": round(seconds, 3), "ok": result.ok})
+                yield ToolEnd(call["name"], seconds, len(result.output), result.ok, result.display, result.permission)
+                stats["tools"].append({"name": call["name"], "seconds": round(seconds, 3), "ok": result.ok,
+                                       "permission": result.permission})
                 turn.append({"type": "function_call_output", "call_id": call["call_id"], "output": result.output})
         else:
             raise LLMError(f"tool loop did not finish within {self.max_steps} steps")

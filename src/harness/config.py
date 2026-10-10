@@ -34,6 +34,10 @@ def workspace_root() -> Path:
     return Path(os.environ.get("HARNESS_WORKSPACE", ".")).expanduser().resolve()
 
 
+def permissions_path() -> Path:
+    return sessions_dir().parent / "permissions.json"
+
+
 def sessions_dir() -> Path:
     """Global, so you can resume a session from any directory."""
     return Path(os.environ.get("HARNESS_HOME", "~/.ai-harness")).expanduser() / "sessions"

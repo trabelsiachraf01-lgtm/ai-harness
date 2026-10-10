@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
+from harness.permissions import Permissions, Request
 from harness.tools.base import Tool, ToolError
 
 
@@ -11,12 +12,16 @@ class ToolResult:
     output: str
     ok: bool = True
     display: str | None = None
+    permission: str | None = None  # how the call was allowed: once / session / always, or denied
 
 
 class ToolRegistry:
     """Holds client tools (we run them) and server tools (the provider runs them, spec only)."""
 
-    def __init__(self, tools: Iterable[Tool] = (), server_tools: Iterable[dict] = (), max_output_chars: int = 20_000):
+    def __init__(self, tools: Iterable[Tool] = (), server_tools: Iterable[dict] = (), max_output_chars: int = 20_000,
+                 permissions: Permissions | None = None):
+        """`permissions=None` runs every tool without asking (tests, trusted internal use)."""
+        self.permissions = permissions
         self._tools = {t.name: t for t in tools}
         self._server_tools = list(server_tools)
         self.max_output_chars = max_output_chars
@@ -34,6 +39,19 @@ class ToolRegistry:
         except ValidationError as e:
             problems = "; ".join(f"{'.'.join(map(str, err['loc'])) or 'arguments'}: {err['msg']}" for err in e.errors())
             return ToolResult(f"Error: invalid arguments: {problems}", ok=False)
+        permission = None
+        if self.permissions is not None and tool.needs_approval:
+            try:
+                request = Request(tool.name, tool.scope(args), tool.describe(args))
+            except Exception as e:
+                return ToolResult(f"Error: {type(e).__name__}: {e}", ok=False)
+            verdict = self.permissions.check(request)
+            if not verdict.allow:
+                why = f" Reason: {verdict.reason}" if verdict.reason else ""
+                return ToolResult(
+                    f"Error: the user denied this call.{why} Do not retry the same call; "
+                    "ask the user or take a different approach.", ok=False, permission="denied")
+            permission = verdict.source
         try:
             output = tool.run(args)
             display = tool.display(args)
@@ -44,4 +62,4 @@ class ToolRegistry:
         extra = len(output) - self.max_output_chars
         if extra > 0:  # a tool result must never be able to flood the context
             output = f"{output[: self.max_output_chars]}\n[output truncated: {extra} more characters]"
-        return ToolResult(output, display=display)
+        return ToolResult(output, display=display, permission=permission)

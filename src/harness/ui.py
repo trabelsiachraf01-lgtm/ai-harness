@@ -6,11 +6,14 @@ The runner yields events; everything visual lives here.
 
 import json
 import shutil
+import sys
+import termios
+import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from prompt_toolkit import PromptSession
+from prompt_toolkit import PromptSession, prompt
 from prompt_toolkit.application import Application
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.data_structures import Point
@@ -24,12 +27,14 @@ from prompt_toolkit.styles import Style as PromptStyle
 from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.segment import Segment
 from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text as RichText
 from rich.theme import Theme
 
+from harness.permissions import Decision, Permissions, Request
 from harness.runner import LLMError, LLMRunner, Text, ToolEnd, ToolUse
 from harness.sessions import Session
 
@@ -56,7 +61,9 @@ THEME = Theme({
     "markdown.item.number": PALETTE["accent"],
 })
 
-COMMANDS = {"/new": "start a new session", "/sessions": "switch session", "/details": "show tool calls of the last reply", "/clear": "restart this session's context", "/help": "show commands", "/exit": "quit"}
+FILE_CHANGES = {"write_file": "wrote", "edit_file": "edited"}  # always shown, never folded away
+
+COMMANDS = {"/new": "start a new session", "/sessions": "switch session", "/details": "show tool calls of the last reply", "/clear": "restart this session's context", "/permissions": "list or revoke allow rules", "/help": "show commands", "/exit": "quit"}
 
 
 def make_console() -> Console:
@@ -103,6 +110,7 @@ class ReplyView:
         self._live: Live | None = None
         self._plan: str | None = None
         self._plan_dirty = False
+        self._last_use: ToolUse | None = None
 
     def waiting(self, label: str = "thinking") -> None:
         spinner = Spinner("dots", text=RichText(f"{label}…", style="muted"), style="accent")
@@ -115,13 +123,20 @@ class ReplyView:
     def tool_use(self, event: ToolUse) -> None:
         self.flush_text()
         self.log.append(event)
+        self._last_use = event
         self.waiting(event.name)
 
     def tool_end(self, event: ToolEnd) -> None:
         self.log.append(event)
         if event.name == "plan" and event.ok and event.display:
             self._plan, self._plan_dirty = event.display, True
+        if event.name in FILE_CHANGES and event.ok and self._last_use is not None:
+            self.console.print(file_change_line(event.name, tool_detail(self._last_use)))
         self.waiting("thinking")
+
+    def pause(self) -> None:
+        """Stop the spinner so a prompt can use the terminal."""
+        self._stop()
 
     def flush_text(self) -> None:
         """End the current text block: print a changed plan, then the reply as Markdown."""
@@ -168,10 +183,97 @@ class ReplyView:
             self._live = None
 
 
-def stream_reply(console: Console, runner: LLMRunner, message: str) -> list:
+APPROVAL_KEYS = "osSaA"
+PERMISSION_LABELS = {"once": "allowed once", "session": "allowed (session rule)",
+                     "always": "allowed (saved rule)", "denied": "denied"}
+
+
+def _drain_input(settle: float = 0.3) -> None:
+    """Throw away keys typed before the prompt appeared. Someone typing their next message while
+    the model works must not answer an approval by accident (`s` and `o` are approvals)."""
+    if not sys.stdin.isatty():
+        return
+    termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    time.sleep(settle)  # keys still arriving as the prompt opens
+    termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+
+
+def _ask_key() -> str:
+    """One keypress. Anything unrecognised, including Enter, means deny."""
+    _drain_input()
+    keys = KeyBindings()
+    for key in APPROVAL_KEYS:
+        keys.add(key)(lambda event, key=key: event.app.exit(result=key))
+    for key in ("d", "n", "escape", "c-c"):
+        keys.add(key)(lambda event: event.app.exit(result="d"))
+    session = PromptSession(
+        message=[("class:prompt", " choose ❯ ")], key_bindings=keys, erase_when_done=True,
+        style=PromptStyle.from_dict({"prompt": PALETTE["muted"]}),
+    )
+    try:
+        return session.prompt()
+    except (KeyboardInterrupt, EOFError):
+        return "d"
+
+
+class TerminalApprover:
+    """Asks the person at the terminal. Every call shows exactly what will run."""
+
+    def __init__(self, console: Console):
+        self.console = console
+        self.view: ReplyView | None = None  # set by stream_reply so the spinner can step aside
+
+    def __call__(self, request: Request) -> Decision:
+        if self.view is not None:
+            self.view.pause()
+        rule = f"{request.tool}:{request.scope}" if request.scope else request.tool
+        self.console.print(Panel(
+            RichText(request.detail), title=RichText.assemble((request.tool, "bold tool"), (" wants to run", "muted")),
+            title_align="left", border_style="tool", padding=(0, 1)))
+        self.console.print(RichText.assemble(
+            ("  [o]", "accent"), (" once   ", "muted"), ("[s]", "accent"), (f" this session ({rule})   ", "muted"),
+            ("[a]", "accent"), (f" always ({rule})   ", "muted"), ("[d]", "accent"), (" deny   ", "muted"),
+            ("S/A = whole tool", "muted")))
+        decision = _decision_for(_ask_key(), self._ask_reason)
+        if self.view is not None and decision.allow:
+            self.view.waiting(request.tool)
+        return decision
+
+    @staticmethod
+    def _ask_reason() -> str | None:
+        try:
+            return prompt("  reason for denying (optional, Enter to skip) ❯ ").strip() or None
+        except (KeyboardInterrupt, EOFError):
+            return None
+
+
+def _decision_for(key: str, ask_reason) -> Decision:
+    if key == "o":
+        return Decision(True)
+    if key in ("s", "S"):
+        return Decision(True, "session", whole_tool=key == "S")
+    if key in ("a", "A"):
+        return Decision(True, "always", whole_tool=key == "A")
+    return Decision(False, reason=ask_reason())
+
+
+def permissions_text(console: Console, permissions: Permissions) -> None:
+    if not permissions.session and not permissions.always:
+        console.print(RichText("  no allow rules: every call asks", style="muted"))
+        return
+    for label, rules in (("this session", permissions.session), ("always", permissions.always)):
+        for rule in sorted(rules):
+            console.print(RichText.assemble(("  ", ""), (rule, "accent"), (f"  {label}", "muted")))
+    console.print(RichText("  /permissions revoke <rule> removes one", style="muted"))
+
+
+def stream_reply(console: Console, runner: LLMRunner, message: str,
+                 approver: "TerminalApprover | None" = None) -> list:
     """Draw one turn. Returns the tool log of this turn, for /details."""
     console.print()
     view = ReplyView(console)
+    if approver is not None:
+        approver.view = view
     view.waiting()
     try:
         for event in runner.chat(message):
@@ -192,6 +294,9 @@ def stream_reply(console: Console, runner: LLMRunner, message: str) -> list:
         if summary := view.summary():
             console.print(RichText("  " + summary, style="muted"))
         console.print(RichText("  " + stats_line(runner.last_stats), style="muted"))
+    finally:
+        if approver is not None:
+            approver.view = None
     return view.log
 
 
@@ -207,9 +312,14 @@ def render_details(console: Console, log: list) -> None:
         status = ("ok", "ok") if event.ok else ("FAILED", "error")
         console.print(RichText.assemble(
             ("  ← ", "tool"), (event.name, "bold tool"), ("  ", ""), status,
-            (f"  {event.seconds:.1f}s · {event.chars:,} chars", "muted")))
+            (f"  {event.seconds:.1f}s · {event.chars:,} chars", "muted"),
+            (f" · {PERMISSION_LABELS[event.permission]}" if event.permission else "", "muted")))
         if event.display:
             console.print(_checklist(event.display))
+
+
+def file_change_line(tool: str, path: str) -> RichText:
+    return RichText.assemble(("  ✎ ", "tool"), (f"{FILE_CHANGES[tool]} ", "muted"), (path, "bold"))
 
 
 def tool_detail(event: ToolUse) -> str:
@@ -360,6 +470,7 @@ def replay(console: Console, session: Session) -> None:
     the reply as Markdown, and the folded tool-call summary."""
     items = session.items
     names = {i["call_id"]: i["name"] for i in items if i.get("type") == "function_call"}
+    arguments = {i["call_id"]: i["arguments"] for i in items if i.get("type") == "function_call"}
     tool_counts: Counter = Counter()
     plan: str | None = None  # a checklist waiting to be printed, as in the live view
 
@@ -385,6 +496,10 @@ def replay(console: Console, session: Session) -> None:
             console.print(RichText.assemble(("you ❯ ", "bold accent"), (_text(item), "")))
         elif item.get("type") == "function_call":
             tool_counts[item["name"]] += 1
+        elif (item.get("type") == "function_call_output" and names.get(item["call_id"]) in FILE_CHANGES
+              and not item["output"].startswith("Error:")):
+            path = tool_detail(ToolUse(names[item["call_id"]], arguments[item["call_id"]]))
+            console.print(file_change_line(names[item["call_id"]], path))
         elif item.get("type") == "function_call_output" and names.get(item["call_id"]) == "plan":
             lines = [l for l in item["output"].splitlines() if l[:3] in ("[ ]", "[~]", "[x]")]
             plan = "\n".join(lines) or plan

@@ -28,6 +28,12 @@ class FetchUrl(Tool):
         self.page_chars = page_chars
         self.max_bytes = max_bytes
 
+    def scope(self, args: "FetchUrl.Args") -> str | None:
+        return urlsplit(args.url).hostname
+
+    def describe(self, args: "FetchUrl.Args") -> str:
+        return args.url
+
     def run(self, args: "FetchUrl.Args") -> str:
         text = self._load(args.url)
         page = text[args.start : args.start + self.page_chars]
