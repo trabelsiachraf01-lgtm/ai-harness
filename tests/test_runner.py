@@ -193,3 +193,17 @@ def test_truncated_stream_and_empty_reply_are_errors(tmp_path):
     r = runner(tmp_path, [sse(completed([REASONING]))])
     with pytest.raises(LLMError, match="empty"):
         list(r.chat("hi"))
+
+
+def test_plan_display_reaches_the_ui_event(tmp_path):
+    args = {"steps": [{"step": "read", "status": "in_progress"}, {"step": "write", "status": "pending"}]}
+    r = runner(tmp_path, [sse(completed([call("plan", args)])), reply("ok")], tools=default_plan_registry())
+    events = list(r.chat("make a plan"))
+    end = next(e for e in events if isinstance(e, ToolEnd))
+    assert end.display == "[~] read\n[ ] write"
+    assert "[~] read" in r.sent[1]["input"][-1]["output"]  # model gets the same text
+
+
+def default_plan_registry():
+    from harness.tools.plan import Plan
+    return ToolRegistry([Plan()])

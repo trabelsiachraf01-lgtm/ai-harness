@@ -35,6 +35,7 @@ class ToolEnd:  # a client tool finished
     seconds: float
     chars: int
     ok: bool
+    display: str | None = None
 
 
 @dataclass
@@ -100,11 +101,11 @@ class LLMRunner:
                     raise LLMError("model returned an empty reply")
                 break
             for call in calls:
-                yield ToolUse(call["name"], _short(call["arguments"]))
+                yield ToolUse(call["name"], call["arguments"])
                 t0 = time.perf_counter()
                 result = self.tools.run(call["name"], call["arguments"])
                 seconds = time.perf_counter() - t0
-                yield ToolEnd(call["name"], seconds, len(result.output), result.ok)
+                yield ToolEnd(call["name"], seconds, len(result.output), result.ok, result.display)
                 stats["tools"].append({"name": call["name"], "seconds": round(seconds, 3), "ok": result.ok})
                 turn.append({"type": "function_call_output", "call_id": call["call_id"], "output": result.output})
         else:
@@ -193,10 +194,6 @@ def _text_of(output: list[dict]) -> str:
     return "".join(
         part.get("text", "") for item in output if item["type"] == "message" for part in item["content"]
     )
-
-
-def _short(arguments: str, limit: int = 100) -> str:
-    return arguments if len(arguments) <= limit else arguments[:limit] + "…"
 
 
 def _reason(event: dict) -> str:
