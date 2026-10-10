@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 STATS = "turn_stats"
+CLEAR = "context_clear"  # marks where the model's context restarts; earlier lines stay on disk
 
 
 @dataclass
@@ -45,8 +46,12 @@ class Session:
             text = text[: text.rfind("\n") + 1]
             path.write_text(text)
         header, *lines = text.splitlines()
-        records = [json.loads(line) for line in lines]
-        items = [_normalize(r) for r in records if r.get("type") != STATS]
+        items: list[dict] = []
+        for record in (json.loads(line) for line in lines):
+            if record.get("type") == CLEAR:
+                items = []  # everything before the marker is history, not context
+            elif record.get("type") != STATS:
+                items.append(_normalize(record))
         return cls(path, json.loads(header)["title"], items)
 
     @classmethod
@@ -59,6 +64,15 @@ class Session:
             except (ValueError, KeyError):
                 continue
         return sessions
+
+    def clear(self) -> None:
+        """Restart the model's context. The transcript stays on disk; usage stats are kept."""
+        if self.path.exists():
+            with self.path.open("a") as f:
+                f.write(json.dumps({"type": CLEAR, "at": datetime.now().isoformat(timespec="seconds")}) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        self.items = []
 
     def append_turn(self, items: list[dict], stats: dict) -> None:
         lines: list[dict] = []

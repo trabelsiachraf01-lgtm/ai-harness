@@ -62,3 +62,24 @@ def test_list_is_newest_first_and_skips_garbage(tmp_path):
     b.append_turn([U, A], STATS)
     (tmp_path / "junk.jsonl").write_text("not json\n")
     assert [s.title for s in Session.list(tmp_path)] == ["b", "a"]
+
+
+def test_clear_restarts_context_but_keeps_the_transcript(tmp_path):
+    s = Session.new(tmp_path)
+    s.append_turn([U, A], STATS)
+    s.clear()
+    assert s.items == [] and s.turns == 0
+    assert Session.load(s.path).items == []  # the reset survives a restart
+
+    s.append_turn([{"role": "user", "content": "again"}, A], STATS)
+    loaded = Session.load(s.path)
+    assert [i.get("content") for i in loaded.items][0] == "again"
+    assert loaded.turns == 1
+    assert '"hello there"' in s.path.read_text()  # history is still on disk
+    assert loaded.title == "hello there"  # title is kept
+
+
+def test_clear_on_a_new_session_writes_nothing(tmp_path):
+    s = Session.new(tmp_path)
+    s.clear()
+    assert not s.path.exists()
