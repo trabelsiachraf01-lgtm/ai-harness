@@ -15,6 +15,7 @@ def render(steps: list["Plan.Step"]) -> str:
 
 class Plan(Tool):
     name = "plan"
+    needs_approval = False
     description = (
         "Create or update the plan for the current task. Send the complete list every time: each call "
         "replaces the previous plan. Use it for tasks with three or more steps. Keep exactly one step "

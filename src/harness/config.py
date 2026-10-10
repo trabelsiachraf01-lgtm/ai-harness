@@ -29,6 +29,11 @@ class LLMConfig:
         )
 
 
+def workspace_root() -> Path:
+    """The only folder the file tools may touch. Defaults to where you started the harness."""
+    return Path(os.environ.get("HARNESS_WORKSPACE", ".")).expanduser().resolve()
+
+
 def sessions_dir() -> Path:
     """Global, so you can resume a session from any directory."""
     return Path(os.environ.get("HARNESS_HOME", "~/.ai-harness")).expanduser() / "sessions"
