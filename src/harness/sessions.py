@@ -92,5 +92,5 @@ class Session:
 def _normalize(record: dict) -> dict:
     # Sessions from before tools stored {"role", "content", "model", "usage", ...} per message.
     if "type" not in record:
-        return {"role": record["role"], "content": record["content"]}
+        return {k: record[k] for k in ("role", "content", "images") if k in record}
     return record

@@ -1,16 +1,19 @@
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 
 import httpx
 
+from harness.attachments import Image
 from harness.config import LLMConfig
 from harness.prompts import SYSTEM_PROMPT, tools_prompt
 from harness.sessions import Session
 from harness.tools import ToolRegistry, default_registry
 
+MAX_LIVE_IMAGES = 4  # images kept attached across turns; ~2k tokens each
 SERVER_SEARCH_ITEMS = {"web_search_call", "openrouter:web_search"}
 
 
@@ -75,8 +78,11 @@ class LLMRunner:
             headers={"Authorization": f"Bearer {config.api_key}", "X-Title": "ai-harness"},
         )
 
-    def chat(self, user_message: str) -> Iterator[Text | ToolUse | ToolEnd]:
+    def chat(self, user_message: str, images: Sequence[Image] = ()) -> Iterator[Text | ToolUse | ToolEnd]:
         """One user message -> model calls and tool calls until the model answers.
+
+        `images` are saved as paths on the user message and re-read from disk on every call. Only
+        the MAX_LIVE_IMAGES most recent stay attached; older ones fall back to the typed text.
 
         Normally the turn is saved when it completes, and a failed or interrupted turn leaves the
         session untouched. The exception is a turn in which tools already ran: their effects are
@@ -84,7 +90,10 @@ class LLMRunner:
         remembers what it did.
         """
         self.last_stats = None
-        turn = [{"role": "user", "content": user_message}]  # everything this turn adds to the session
+        user = {"role": "user", "content": user_message}
+        if images:
+            user["images"] = [{"name": i.name, "path": str(i.path)} for i in images]
+        turn = [user]  # everything this turn adds to the session
         safe = 1  # turn[:safe] ends right after a complete step: no call without its output
         stats = {"model": None, "steps": 0, "searches": [], "tools": [],
                  "usage": {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
@@ -102,7 +111,7 @@ class LLMRunner:
         try:
             for _ in range(self.max_steps):
                 response = None
-                for event in self._stream(self._instructions(), [*self.session.items, *turn]):
+                for event in self._stream(self._instructions(), _wire([*self.session.items, *turn])):
                     if isinstance(event, _Final):
                         response = event.response
                         continue
@@ -186,6 +195,35 @@ class LLMRunner:
         except httpx.HTTPError as e:
             raise LLMError(f"network error: {e}") from e
         raise LLMError("stream ended before the response completed")
+
+
+def _wire(items: list[dict], budget: int = MAX_LIVE_IMAGES) -> list[dict]:
+    """History as the API takes it: the newest `budget` images attached, the rest left as the typed
+    text. The session's `images` field is ours, so it never goes over the wire."""
+    wire = []
+    for item in reversed(items):
+        if "images" in item:
+            keep = item["images"][-budget:] if budget else []
+            budget -= len(keep)
+            item = _attach(item, keep)
+        wire.append(item)
+    return wire[::-1]
+
+
+def _attach(item: dict, refs: list[dict]) -> dict:
+    """Text first (OpenRouter's advice), then each image under a label so several can be told apart."""
+    plain = {k: v for k, v in item.items() if k != "images"}
+    if not refs:
+        return plain
+    parts = [{"type": "input_text", "text": item["content"]}]
+    for ref in refs:
+        try:
+            url = Image(ref["name"], Path(ref["path"])).data_url
+        except OSError:  # moved or deleted since it was attached
+            parts.append({"type": "input_text", "text": f"[image unavailable: {ref['name']}]"})
+            continue
+        parts += [{"type": "input_text", "text": f"[image: {ref['name']}]"}, {"type": "input_image", "image_url": url}]
+    return {**plain, "content": parts}
 
 
 def _persistable(item: dict) -> dict | None:

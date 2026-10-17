@@ -83,3 +83,10 @@ def test_clear_on_a_new_session_writes_nothing(tmp_path):
     s = Session.new(tmp_path)
     s.clear()
     assert not s.path.exists()
+
+
+def test_image_references_survive_a_reload(tmp_path):
+    s = Session.new(tmp_path)
+    user = {**U, "images": [{"name": "a.png", "path": "/x/a.png"}]}
+    s.append_turn([user, A], STATS)
+    assert Session.load(s.path).items[0] == user

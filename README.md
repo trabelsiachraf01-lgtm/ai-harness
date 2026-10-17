@@ -31,6 +31,11 @@ Commands: `/new`, `/sessions`, `/clear` (reset the model's context and the scree
 in the file), `/details` (full tool log of the last reply), `/help`, `/exit`. Resuming a session replays
 the whole conversation.
 
+Images: put `@path/to/shot.png` in a message (png, jpg, webp, gif; up to 8 MB). A path dragged into the
+terminal attaches too, without the `@`. The session stores the path, not the bytes, and re-reads the file on
+every call, so the image stays in view for follow-ups ("review it"). Only the 4 most recent images stay
+attached (about 2k tokens each); older ones fall back to your text. If a file was moved, the model is told.
+
 Options:
 
 ```bash

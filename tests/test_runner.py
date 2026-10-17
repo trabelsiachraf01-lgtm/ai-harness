@@ -5,8 +5,9 @@ import httpx
 import pytest
 from pydantic import BaseModel
 
+from harness.attachments import Image
 from harness.config import LLMConfig
-from harness.runner import LLMError, LLMRunner, Text, ToolEnd, ToolUse
+from harness.runner import LLMError, LLMRunner, Text, ToolEnd, ToolUse, _wire
 from harness.sessions import Session
 from harness.tools import Tool, ToolRegistry, web_search_spec
 
@@ -258,3 +259,51 @@ def test_plan_display_reaches_the_ui_event(tmp_path):
 def default_plan_registry():
     from harness.tools.plan import Plan
     return ToolRegistry([Plan()])
+
+
+# ---- images ---------------------------------------------------------------------------------
+
+def attached(tmp_path, name="a.png", data=b"ABC"):
+    (tmp_path / name).write_bytes(data)
+    return Image(name, tmp_path / name)
+
+
+def sees_image(body, url="data:image/png;base64,QUJD"):
+    return {"type": "input_image", "image_url": url} in body["input"][0]["content"]
+
+
+def test_images_stay_attached_for_follow_ups_and_are_saved_as_paths(tmp_path):
+    image = attached(tmp_path)
+    r = runner(tmp_path, [sse(completed([call()])), reply("done"), reply("again")], tools=ToolRegistry([Echo()]))
+
+    list(r.chat("look @a.png", [image]))
+    assert r.sent[0]["input"][0]["content"] == [
+        {"type": "input_text", "text": "look @a.png"},
+        {"type": "input_text", "text": "[image: a.png]"},
+        {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+    ]
+    assert sees_image(r.sent[1])  # the call after the tool ran
+    assert r.session.items[0] == {"role": "user", "content": "look @a.png",
+                                  "images": [{"name": "a.png", "path": str(image.path)}]}
+
+    list(r.chat("review it"))  # the follow-up still sees the image
+    assert sees_image(r.sent[2])
+    assert "QUJD" not in r.session.path.read_text()
+    assert not any("images" in item for body in r.sent for item in body["input"])
+
+
+def test_only_the_newest_images_stay_attached():
+    refs = lambda n: [{"name": f"{n}.png", "path": "/nope"}]
+    items = [{"role": "user", "content": f"m{n}", "images": refs(n)} for n in range(3)]
+    wire = _wire(items, budget=2)
+    assert wire[0] == {"role": "user", "content": "m0"}
+    assert all(isinstance(m["content"], list) for m in wire[1:])
+
+
+def test_a_missing_file_is_reported_to_the_model_not_a_crash(tmp_path):
+    image = attached(tmp_path)
+    r = runner(tmp_path, [reply("one"), reply("two")])
+    list(r.chat("see @a.png", [image]))
+    image.path.unlink()
+    list(r.chat("again"))
+    assert {"type": "input_text", "text": "[image unavailable: a.png]"} in r.sent[1]["input"][0]["content"]

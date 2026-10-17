@@ -5,7 +5,8 @@ from dataclasses import replace
 from rich.text import Text as RichText
 
 from harness import ui
-from harness.config import LLMConfig, permissions_path, sessions_dir
+from harness.attachments import AttachmentError, find_images
+from harness.config import LLMConfig, permissions_path, sessions_dir, workspace_root
 from harness.permissions import Permissions, allow_all
 from harness.runner import LLMRunner
 from harness.sessions import Session
@@ -54,7 +55,12 @@ def main() -> int:
         if not line:
             continue
         if not line.startswith("/"):
-            last_log = ui.stream_reply(console, runner, line, approver=terminal)
+            try:
+                images = find_images(line, workspace_root())
+            except AttachmentError as e:
+                console.print(RichText(f"  {e}", style="error"))
+                continue
+            last_log = ui.stream_reply(console, runner, line, approver=terminal, images=images)
             continue
 
         command = line.split()[0]

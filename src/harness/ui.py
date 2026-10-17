@@ -10,6 +10,7 @@ import sys
 import termios
 import time
 from collections import Counter
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from rich.table import Table
 from rich.text import Text as RichText
 from rich.theme import Theme
 
+from harness.attachments import Image
 from harness.permissions import Decision, Permissions, Request
 from harness.runner import LLMError, LLMRunner, Text, ToolEnd, ToolUse
 from harness.sessions import Session
@@ -268,15 +270,17 @@ def permissions_text(console: Console, permissions: Permissions) -> None:
 
 
 def stream_reply(console: Console, runner: LLMRunner, message: str,
-                 approver: "TerminalApprover | None" = None) -> list:
+                 approver: "TerminalApprover | None" = None, images: Sequence[Image] = ()) -> list:
     """Draw one turn. Returns the tool log of this turn, for /details."""
     console.print()
+    for image in images:
+        console.print(RichText(f"  attached {image.name} · {image.size / 1024:.0f} KB", style="muted"))
     view = ReplyView(console)
     if approver is not None:
         approver.view = view
     view.waiting()
     try:
-        for event in runner.chat(message):
+        for event in runner.chat(message, images):
             if isinstance(event, Text):
                 view.text(event.text)
             elif isinstance(event, ToolUse):
@@ -535,6 +539,7 @@ def banner(console: Console, runner: LLMRunner) -> None:
 def help_text(console: Console) -> None:
     for command, meaning in COMMANDS.items():
         console.print(RichText.assemble((f"  {command:<10}", "accent"), (meaning, "muted")))
+    console.print(RichText.assemble((f"  {'@image':<10}", "accent"), ("attach an image: @shot.png (png, jpg, webp, gif)", "muted")))
 
 
 def _text(item: dict) -> str:
